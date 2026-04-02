@@ -37,14 +37,14 @@ On the HPC cluster head node after connecting:
 
 ```bash
 cd ~
-git clone https://github.com/rmd35/sptrsv-GPU-Project.git
-cd sptrsv-GPU-Project/sptrsv
+git clone https://github.com/lauremhsn/SpTRSV.git
+cd SpTRSV/sptrsv
 ```
 
 ### 2. Directory Structure
 
 ```
-sptrsv-GPU-Project/
+SpTRSV/
 ├── sptrsv/
 │   ├── Makefile
 │   ├── main.cu
@@ -52,7 +52,7 @@ sptrsv-GPU-Project/
 │   ├── matrix.h
 │   ├── common.h
 │   ├── timer.h
-│   ├── kernelCPU.cu
+│   ├── kernelCPU0.cu
 │   ├── kernel0.cu
 │   ├── kernel1.cu
 │   ├── kernel2.cu
@@ -132,14 +132,14 @@ nvidia-smi
 The Makefile requires C++11 support. Compile with the appropriate flags:
 
 ```bash
-cd ~/sptrsv-GPU-Project/sptrsv
+cd ~/SpTRSV/sptrsv
 make NVCC_FLAGS="-O3 -std=c++11"
 ```
 
 If compilation is successful, you should see `sptrsv` executable created.
 
 **Note about kernels:** The project includes:
-- `kernelCPU.cu` - CPU baseline implementation
+- `kernelCPU0.cu` - CPU baseline implementation
 - `kernel0.cu`, `kernel1.cu`, `kernel2.cu`, `kernel3.cu` - GPU kernel variants
 
 The Makefile compiles all kernels by default. The `-d` flag at runtime selects which dataset to use, not which kernel.
@@ -280,7 +280,7 @@ srun --partition=cudadev --gres=gpu:1 --time=1:00:00 --pty bash
 |------|---------|
 | `main.cu` | Main program and evaluation framework |
 | `matrix.cu` / `matrix.h` | Matrix I/O and utilities |
-| `kernelCPU.cu` | CPU baseline SpTRSV solver |
+| `kernelCPU0.cu` | CPU baseline SpTRSV solver |
 | `kernel0.cu` - `kernel3.cu` | GPU kernel implementations |
 | `common.h` | Shared data structures |
 | `timer.h` | Performance timing utilities |
@@ -308,4 +308,4 @@ srun --partition=cudadev --gres=gpu:1 --time=1:00:00 --pty bash
 
 **Last Updated:** April 2, 2026
 **Author:** CMPS 324 Project
-**Repository:** https://github.com/rmd35/sptrsv-GPU-Project
+**Repository:** https://github.com/lauremhsn/SpTRSV.git

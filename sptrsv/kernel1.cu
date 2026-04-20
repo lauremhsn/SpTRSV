@@ -5,9 +5,8 @@ __global__ void kernel1(unsigned int n, unsigned int k,
                         const unsigned int* __restrict__ cscColPtrs,
                         const unsigned int* __restrict__ cscRowIdxs,
                         const float* __restrict__ cscVals,
-                        const unsigned int* __restrict__ csrRowPtrs,
-                        const unsigned int* __restrict__ csrColIdxs,
-                        const float* __restrict__ csrVals,
+                        const unsigned int* __restrict__ cscDownStart,
+                        const float* __restrict__ diag,
                         const float* __restrict__ B, float* X,
                         float* partialSum, int* inDegree, int* nextRow) {
 
@@ -26,45 +25,38 @@ __global__ void kernel1(unsigned int n, unsigned int k,
 
         if (b == 0) {
             cuda::atomic_ref<int, cuda::thread_scope_device> deg(inDegree[i]);
-            while (deg.load(cuda::memory_order_acquire) != 0);
+            while (deg.load(cuda::memory_order_acquire) != 0) {
+#if __CUDA_ARCH__ >= 700
+                __nanosleep(8);
+#endif
+            }
         }
         __syncthreads();
 
         float xi = 0.0f;
         if (b < k) {
-            float diag = 1.0f;
-            for (unsigned int p = csrRowPtrs[i]; p < csrRowPtrs[i + 1]; ++p) {
-                if (csrColIdxs[p] == (unsigned int)i) {
-                    diag = (csrVals[p] != 0.0f) ? csrVals[p] : 1.0f;
-                    break;
-                }
-            }
-            xi = (B[i * k + b] - partialSum[i * k + b]) / diag;
+            xi = (B[i * k + b] - partialSum[i * k + b]) / diag[i];
             X[i * k + b] = xi;
         }
         __syncthreads();
 
-        unsigned int cStart = cscColPtrs[i];
-        unsigned int cEnd   = cscColPtrs[i + 1];
+        unsigned int pStart = cscDownStart[i];
+        unsigned int pEnd   = cscColPtrs[i + 1];
 
         if (b < k) {
-            for (unsigned int p = cStart; p < cEnd; ++p) {
+            for (unsigned int p = pStart; p < pEnd; ++p) {
                 unsigned int r = cscRowIdxs[p];
-                if (r > (unsigned int)i) {
-                    atomicAdd(&partialSum[r * k + b], cscVals[p] * xi);
-                }
+                atomicAdd(&partialSum[r * k + b], cscVals[p] * xi);
             }
         }
 
         __threadfence();
         __syncthreads();
 
-        for (unsigned int p = cStart + b; p < cEnd; p += blockDim.x) {
+        for (unsigned int p = pStart + b; p < pEnd; p += blockDim.x) {
             unsigned int r = cscRowIdxs[p];
-            if (r > (unsigned int)i) {
-                cuda::atomic_ref<int, cuda::thread_scope_device> deg(inDegree[r]);
-                deg.fetch_sub(1, cuda::memory_order_release);
-            }
+            cuda::atomic_ref<int, cuda::thread_scope_device> deg(inDegree[r]);
+            deg.fetch_sub(1, cuda::memory_order_release);
         }
         __syncthreads();
     }
@@ -84,40 +76,73 @@ void sptrsv_gpu1(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
     cudaMemcpy(&bPtr, B, sizeof(DenseMatrix), cudaMemcpyDeviceToHost);
     cudaMemcpy(&xPtr, X, sizeof(DenseMatrix), cudaMemcpyDeviceToHost);
 
-    int* inDegree_h = (int*)calloc(n, sizeof(int));
+    int*          inDegree_h     = (int*)calloc(n, sizeof(int));
+    float*        diag_h         = (float*)malloc(n * sizeof(float));
+    unsigned int* cscDownStart_h = (unsigned int*)malloc(n * sizeof(unsigned int));
+
     for (unsigned int r = 0; r < n; ++r) {
+        diag_h[r] = 1.0f;
         for (unsigned int p = L_r_host->rowPtrs[r]; p < L_r_host->rowPtrs[r + 1]; ++p) {
-            if (L_r_host->colIdxs[p] < r) {
+            unsigned int c = L_r_host->colIdxs[p];
+            if (c < r) {
                 inDegree_h[r]++;
+            } else if (c == r) {
+                float v = L_r_host->values[p];
+                diag_h[r] = (v != 0.0f) ? v : 1.0f;
             }
         }
     }
 
-    int*   inDegree_d;
-    float* partialSum_d;
-    int*   nextRow_d;
-    cudaMalloc((void**)&inDegree_d,   n * sizeof(int));
-    cudaMalloc((void**)&partialSum_d, (size_t)n * k * sizeof(float));
-    cudaMalloc((void**)&nextRow_d,    sizeof(int));
+    for (unsigned int c = 0; c < n; ++c) {
+        unsigned int start = L_c_host->colPtrs[c];
+        unsigned int end   = L_c_host->colPtrs[c + 1];
+        unsigned int ds    = end;
+        for (unsigned int p = start; p < end; ++p) {
+            if (L_c_host->rowIdxs[p] > c) { ds = p; break; }
+        }
+        cscDownStart_h[c] = ds;
+    }
 
-    cudaMemcpy(inDegree_d, inDegree_h, n * sizeof(int), cudaMemcpyHostToDevice);
+    int*          inDegree_d;
+    float*        partialSum_d;
+    int*          nextRow_d;
+    float*        diag_d;
+    unsigned int* cscDownStart_d;
+    cudaMalloc((void**)&inDegree_d,     n * sizeof(int));
+    cudaMalloc((void**)&partialSum_d,   (size_t)n * k * sizeof(float));
+    cudaMalloc((void**)&nextRow_d,      sizeof(int));
+    cudaMalloc((void**)&diag_d,         n * sizeof(float));
+    cudaMalloc((void**)&cscDownStart_d, n * sizeof(unsigned int));
+
+    cudaMemcpy(inDegree_d,     inDegree_h,     n * sizeof(int),          cudaMemcpyHostToDevice);
+    cudaMemcpy(diag_d,         diag_h,         n * sizeof(float),        cudaMemcpyHostToDevice);
+    cudaMemcpy(cscDownStart_d, cscDownStart_h, n * sizeof(unsigned int), cudaMemcpyHostToDevice);
     cudaMemset(partialSum_d, 0, (size_t)n * k * sizeof(float));
-    cudaMemset(nextRow_d, 0, sizeof(int));
+    cudaMemset(nextRow_d,    0, sizeof(int));
 
     free(inDegree_h);
+    free(diag_h);
+    free(cscDownStart_h);
 
     int numSMs = 0;
     cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
+
+    int blocksPerSM = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, kernel1, (int)k, 0);
+    if (blocksPerSM < 1) blocksPerSM = 1;
+
     dim3 block(k);
-    dim3 grid(numSMs);
+    dim3 grid(numSMs * blocksPerSM);
 
     kernel1<<<grid, block>>>(n, k,
         cscPtr.colPtrs, cscPtr.rowIdxs, cscPtr.values,
-        csrPtr.rowPtrs, csrPtr.colIdxs, csrPtr.values,
+        cscDownStart_d, diag_d,
         bPtr.values, xPtr.values,
         partialSum_d, inDegree_d, nextRow_d);
 
     cudaFree(inDegree_d);
     cudaFree(partialSum_d);
     cudaFree(nextRow_d);
+    cudaFree(diag_d);
+    cudaFree(cscDownStart_d);
 }

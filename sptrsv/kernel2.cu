@@ -1,16 +1,13 @@
 #include "common.h"
 #include <cuda/atomic>
 
-#define TILE 4
-
-__global__ void kernel2(unsigned int  n, unsigned int  k, unsigned int  threads, unsigned int* rowPtrs, unsigned int* colIdxs, float* vals, float* B, float* X, int* ready, int* nextRow){
-    unsigned int tid = threadIdx.x;
-    unsigned int bBase = tid*TILE;
+__global__ void kernel2(unsigned int n, unsigned int k, const unsigned int* __restrict__ rowPtrs, const unsigned int* __restrict__ colIdxs, const float* __restrict__ vals, const unsigned int* __restrict__ cscColPtrs, const unsigned int* __restrict__ cscRowIdxs, const unsigned int* __restrict__ cscDownStart, const float* __restrict__ diagArr, const float* __restrict__ B, float* X, int* inDegree, int* nextRow){
+    unsigned int b = threadIdx.x;
 
     __shared__ int sharedRow;
 
     while (true){
-        if (tid == 0){
+        if (b == 0){
             cuda::atomic_ref<int, cuda::thread_scope_device> nxt(*nextRow);
             sharedRow = nxt.fetch_add(1, cuda::memory_order_relaxed);
         }
@@ -20,56 +17,40 @@ __global__ void kernel2(unsigned int  n, unsigned int  k, unsigned int  threads,
         if (i>=(int)n){
             return;
         }
-
-        if (bBase<k){
-            float sum[TILE];
-            #pragma unroll
-            for (int t = 0; t<TILE; ++t)
-                sum[t] = ((bBase + t)<k) ? B[i*k + bBase + t] : 0.0f;
-
-            float diag = 1.0f;
-
-            for (unsigned int p = rowPtrs[i]; p < rowPtrs[i + 1]; p++){
-                unsigned int j = colIdxs[p];
-                float val = vals[p];
-
-                if (j<i){
-                    //spin until dependency j is done
-                    cuda::atomic_ref<int, cuda::thread_scope_device> rref(ready[j]);
-                    while (rref.load(cuda::memory_order_acquire) == 0)
-                    #if __CUDA_ARCH__ >= 700 //nanosleep was not introduced for some older GPUs, hence the checking of compute compatibility 700.
-                        __nanosleep(32);
-                    #else
-                        ;
-                    #endif
-                    //load TILE values from X[j], reuse val across all TILE
-                    #pragma unroll
-                    for (int t = 0; t<TILE; ++t){
-                        if (bBase + t<k){
-                            sum[t] -= val*X[j*k + bBase + t];
-                        }
-                    }
-                } 
-                else if (j == i){
-                    diag = (val != 0.0f) ? val : 1.0f;
-                }
-            }
-
-            //write TILE results
-            #pragma unroll
-            for (int t = 0; t<TILE; t++){
-                if (bBase + t<k){
-                    X[i*k + bBase + t] = sum[t]/diag;
-                }
-            }
+        if (b == 0){
+            cuda::atomic_ref<int, cuda::thread_scope_device> deg(inDegree[i]);
+            while (deg.load(cuda::memory_order_acquire) != 0)
+            #if __CUDA_ARCH__ >= 700
+                __nanosleep(8);
+            #else
+                ;
+            #endif
         }
-
         __syncthreads();
 
-        if (tid == 0){
-            __threadfence();
-            cuda::atomic_ref<int, cuda::thread_scope_device> rdy(ready[i]);
-            rdy.store(1, cuda::memory_order_release);
+        if (b<k){
+            float sum = B[i*k + b];
+            float d = __ldg(&diagArr[i]);
+
+            for (unsigned int p = rowPtrs[i]; p<rowPtrs[i + 1]; ++p) {
+                unsigned int j = __ldg(&colIdxs[p]);
+                float val = __ldg(&vals[p]);
+                if (j<i) sum -= val*X[j*k + b];
+            }
+            X[i*k + b] = sum/d;
+        }
+        __syncthreads();
+
+        if (b == 0) __threadfence();
+        __syncthreads();
+
+        unsigned int pStart = cscDownStart[i];
+        unsigned int pEnd = cscColPtrs[i + 1];
+
+        for (unsigned int p = pStart + b; p<pEnd; p += blockDim.x) {
+            unsigned int r = cscRowIdxs[p];
+            cuda::atomic_ref<int, cuda::thread_scope_device> deg(inDegree[r]);
+            deg.fetch_sub(1, cuda::memory_order_release);
         }
         __syncthreads();
     }
@@ -83,35 +64,68 @@ void sptrsv_gpu2(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
     //extract device pointers
     CSRMatrix csrPtr;
     cudaMemcpy(&csrPtr, L_r, sizeof(CSRMatrix), cudaMemcpyDeviceToHost);
+    CSCMatrix cscPtr;
+    cudaMemcpy(&cscPtr, L_c, sizeof(CSCMatrix), cudaMemcpyDeviceToHost);
     DenseMatrix bPtr, xPtr;
     cudaMemcpy(&bPtr, B, sizeof(DenseMatrix), cudaMemcpyDeviceToHost);
     cudaMemcpy(&xPtr, X, sizeof(DenseMatrix), cudaMemcpyDeviceToHost);
 
-    int* ready_d;
+    int* inDegree_h = (int*)calloc(n, sizeof(int));
+    float* diag_h = (float*)malloc(n*sizeof(float));
+    unsigned int* cscDownStart_h = (unsigned int*)malloc(n*sizeof(unsigned int));
+
+    for (unsigned int r = 0; r < n; r++){
+        diag_h[r] = 1.0f;
+        for (unsigned int p = L_r_host->rowPtrs[r]; p<L_r_host->rowPtrs[r+1]; p++){
+            unsigned int c = L_r_host->colIdxs[p];
+            if (c<r) inDegree_h[r]++;
+            else if (c == r) {
+                float v = L_r_host->values[p];
+                diag_h[r] = (v != 0.0f) ? v : 1.0f;
+            }
+        }
+    }
+
+    for (unsigned int c = 0; c < n; c++) {
+        unsigned int ds = L_c_host->colPtrs[c + 1];
+        for (unsigned int p = L_c_host->colPtrs[c]; p < L_c_host->colPtrs[c+1]; p++)
+            if (L_c_host->rowIdxs[p] > c) { ds = p; break; }
+        cscDownStart_h[c] = ds;
+    }
+
+    int* inDegree_d;
     int* nextRow_d;
-    cudaMalloc((void**)&ready_d, n*sizeof(int));
+    float* diag_d;
+    unsigned int* cscDownStart_d;
+
+    cudaMalloc((void**)&inDegree_d, n*sizeof(int));
     cudaMalloc((void**)&nextRow_d, sizeof(int));
-    cudaMemset(ready_d, 0, n*sizeof(int));
+    cudaMalloc((void**)&diag_d, n*sizeof(float));
+    cudaMalloc((void**)&cscDownStart_d, n*sizeof(unsigned int));
+
+    cudaMemcpy(inDegree_d, inDegree_h, n*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(diag_d, diag_h, n*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(cscDownStart_d, cscDownStart_h, n*sizeof(unsigned int), cudaMemcpyHostToDevice);
     cudaMemset(nextRow_d, 0, sizeof(int));
 
-    //k/TILE threads per block (each handles TILE columns)
-    unsigned int threads = k/TILE;
+    free(inDegree_h);
+    free(diag_h);
+    free(cscDownStart_h);
 
-    int numSMs, maxThreadsPerSM;
+    int numSMs = 0;
     cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
-    cudaDeviceGetAttribute(&maxThreadsPerSM, cudaDevAttrMaxThreadsPerMultiProcessor, 0);
 
-    int blocksPerSM = maxThreadsPerSM/(int)threads;
-    if (blocksPerSM<1){
-        blocksPerSM = 1;
-    }
-    int numBlocks = numSMs*blocksPerSM;
+    int blocksPerSM = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, kernel2, (int)k, 0);
+    if (blocksPerSM < 1) blocksPerSM = 1;
 
-    dim3 block(threads);
-    dim3 grid(numBlocks);
+    dim3 block(k);
+    dim3 grid(numSMs * blocksPerSM);
 
-    kernel2<<<grid, block>>>(n, k, threads, csrPtr.rowPtrs, csrPtr.colIdxs, csrPtr.values, bPtr.values, xPtr.values, ready_d, nextRow_d);
+    kernel2<<<grid, block>>>(n, k, threads, csrPtr.rowPtrs, csrPtr.colIdxs, csrPtr.values, cscPtr.colPtrs, cscPtr.rowIdxs, cscDownStart_d, diag_d, bPtr.values, xPtr.values, inDegree_d, nextRow_d);
 
-    cudaFree(ready_d);
+    cudaFree(inDegree_d);
     cudaFree(nextRow_d);
+    cudaFree(diag_d);
+    cudaFree(cscDownStart_d);
 }

@@ -27,7 +27,7 @@ struct PreprocCache {
     unsigned int* ready_d  = nullptr;
     unsigned int* rowCtr_d = nullptr;
 
-    float*        sRcpDiag_d = nullptr;
+    float*        sDiag_d    = nullptr;   // exact diag (chain path uses /, not *rcp)
     unsigned int* sOffsets_d = nullptr;
     unsigned int* sCol_d     = nullptr;
     float*        sVal_d     = nullptr;
@@ -44,7 +44,7 @@ void invalidateCache(PreprocCache& c) {
     if (c.lowerVals_d)    cudaFree(c.lowerVals_d);
     if (c.ready_d)        cudaFree(c.ready_d);
     if (c.rowCtr_d)       cudaFree(c.rowCtr_d);
-    if (c.sRcpDiag_d)     cudaFree(c.sRcpDiag_d);
+    if (c.sDiag_d)        cudaFree(c.sDiag_d);
     if (c.sOffsets_d)     cudaFree(c.sOffsets_d);
     if (c.sCol_d)         cudaFree(c.sCol_d);
     if (c.sVal_d)         cudaFree(c.sVal_d);
@@ -57,7 +57,6 @@ void buildPreproc(PreprocCache& c, CSRMatrix* L_r_host) {
     c.n = n;
     c.numNonzeros = L_r_host->numNonzeros;
 
-    // ---- Level scheduling + diagonal extraction (single pass) ----
     std::vector<unsigned int> levels(n, 0);
     std::vector<float>        diag(n, 1.0f);
     unsigned int maxLevel = 0;
@@ -145,9 +144,6 @@ void buildPreproc(PreprocCache& c, CSRMatrix* L_r_host) {
             cudaMalloc(&c.rowCtr_d, sizeof(unsigned int));
         }
     } else {
-        std::vector<float> rcpDiag(n);
-        for (unsigned int r = 0; r < n; ++r) rcpDiag[r] = 1.0f / diag[r];
-
         std::vector<unsigned int> sOffsets_h(n + 1, 0);
         std::vector<unsigned int> sCol_h;
         std::vector<float>        sVal_h;
@@ -173,19 +169,19 @@ void buildPreproc(PreprocCache& c, CSRMatrix* L_r_host) {
         sVal_h.push_back(0.0f); sVal_h.push_back(0.0f);
         unsigned int totalLower = (unsigned int)sCol_h.size();
 
-        cudaMalloc(&c.sRcpDiag_d, n * sizeof(float));
+        cudaMalloc(&c.sDiag_d,    n * sizeof(float));
         cudaMalloc(&c.sOffsets_d, (n + 1) * sizeof(unsigned int));
         cudaMalloc(&c.sCol_d,     totalLower * sizeof(unsigned int));
         cudaMalloc(&c.sVal_d,     totalLower * sizeof(float));
 
-        cudaMemcpy(c.sRcpDiag_d, rcpDiag.data(),    n * sizeof(float),                cudaMemcpyHostToDevice);
+        cudaMemcpy(c.sDiag_d,    diag.data(),       n * sizeof(float),                cudaMemcpyHostToDevice);
         cudaMemcpy(c.sOffsets_d, sOffsets_h.data(), (n + 1) * sizeof(unsigned int),   cudaMemcpyHostToDevice);
         cudaMemcpy(c.sCol_d,     sCol_h.data(),     totalLower * sizeof(unsigned int), cudaMemcpyHostToDevice);
         cudaMemcpy(c.sVal_d,     sVal_h.data(),     totalLower * sizeof(float),        cudaMemcpyHostToDevice);
     }
 }
 
-} // namespace
+} 
 
 __global__ void kernel3_levelset_tpbk(
     unsigned int n, unsigned int k,
@@ -239,8 +235,7 @@ __global__ void kernel3_syncfree(
 {
     __shared__ unsigned int s_chunkStart;
     unsigned int b = threadIdx.x;
-    volatile unsigned int* readyV = (volatile unsigned int*)ready;
-    volatile float*        Xv     = (volatile float*)X;
+    volatile float* Xv = (volatile float*)X;
 
     while (true) {
         if (b == 0) s_chunkStart = atomicAdd(rowCtr, chunkSize);
@@ -261,17 +256,17 @@ __global__ void kernel3_syncfree(
                 unsigned int j   = __ldg(&lowerColIdxs[p]);
                 float        val = __ldg(&lowerVals[p]);
 
-                while (readyV[j] == 0u) { /* spin */ }
+                while (__ldcg(&ready[j]) == 0u) { /* spin */ }
 
                 float xj = Xv[(long)j * k + b];
                 sum -= val * xj;
             }
 
             X[(long)row * k + b] = sum / dg;
-            __threadfence();    
-            __syncthreads();    
+            __threadfence();
+            __syncthreads();
             if (b == 0) {
-                readyV[row] = 1u;
+                ready[row] = 1u;
             }
         }
     }
@@ -288,7 +283,7 @@ __global__ void init_X_from_B(unsigned int n, unsigned int k,
 
 __global__ void kernel3_chain_v2(
     unsigned int n, unsigned int k,
-    const float*        __restrict__ sRcpDiag,
+    const float*        __restrict__ sDiag,
     const unsigned int* __restrict__ sOffsets,
     const unsigned int* __restrict__ sCol,
     const float*        __restrict__ sVal,
@@ -297,36 +292,39 @@ __global__ void kernel3_chain_v2(
     unsigned int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= k) return;
 
-    float        rcp_curr = __ldg(&sRcpDiag[0]);
-    unsigned int rs_curr  = __ldg(&sOffsets[0]);
-    unsigned int re_curr  = __ldg(&sOffsets[1]);
-    unsigned int rowOff   = 0;
+    float        dg_curr = __ldg(&sDiag[0]);
+    unsigned int rs_curr = __ldg(&sOffsets[0]);
+    unsigned int re_curr = __ldg(&sOffsets[1]);
+    unsigned int rowOff  = 0;
 
     for (unsigned int idx = 0; idx < n; ++idx) {
-        float        rcp_next = 0.0f;
-        unsigned int rs_next  = 0;
-        unsigned int re_next  = 0;
+        float        dg_next = 1.0f;
+        unsigned int rs_next = 0;
+        unsigned int re_next = 0;
         if (idx + 1 < n) {
-            rcp_next = __ldg(&sRcpDiag[idx + 1]);
-            rs_next  = __ldg(&sOffsets[idx + 1]);
-            re_next  = __ldg(&sOffsets[idx + 2]);
+            dg_next = __ldg(&sDiag[idx + 1]);
+            rs_next = __ldg(&sOffsets[idx + 1]);
+            re_next = __ldg(&sOffsets[idx + 2]);
         }
 
         float sum = X[rowOff + b];
 
         unsigned int p         = rs_curr;
         unsigned int re_padded = (re_curr + 1u) & ~1u;
+
         for (; p < re_padded; p += 2) {
             uint2  cols = *reinterpret_cast<const uint2*>(&sCol[p]);
             float2 vals = *reinterpret_cast<const float2*>(&sVal[p]);
-            sum -= vals.x * X[cols.x * k + b];
-            sum -= vals.y * X[cols.y * k + b];
+            float p0 = __fmul_rn(vals.x, X[cols.x * k + b]);
+            float p1 = __fmul_rn(vals.y, X[cols.y * k + b]);
+            sum = __fsub_rn(sum, p0);
+            sum = __fsub_rn(sum, p1);
         }
 
-        X[rowOff + b] = sum * rcp_curr;
+        X[rowOff + b] = __fdiv_rn(sum, dg_curr);
 
         rowOff   += k;
-        rcp_curr  = rcp_next;
+        dg_curr   = dg_next;
         rs_curr   = rs_next;
         re_curr   = re_next;
     }
@@ -407,12 +405,13 @@ void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
         int initBlocks  = ((long)n * k + initThreads - 1) / initThreads;
         init_X_from_B<<<initBlocks, initThreads>>>(n, k, bPtr.values, xPtr.values);
 
-        int colWidth = 32;
+        int colWidth = (int)k;
+        if (colWidth > 1024) colWidth = 1024;
         int numBlocks = ((int)k + colWidth - 1) / colWidth;
         kernel3_chain_v2<<<numBlocks, colWidth>>>(
             n, k,
-            g_cache.sRcpDiag_d, g_cache.sOffsets_d,
-            g_cache.sCol_d,     g_cache.sVal_d,
+            g_cache.sDiag_d, g_cache.sOffsets_d,
+            g_cache.sCol_d,  g_cache.sVal_d,
             xPtr.values);
     }
 }

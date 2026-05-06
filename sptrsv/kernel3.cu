@@ -216,7 +216,9 @@ __global__ void kernel3_levelset_tpbk(
             for (unsigned int p = rs; p < re; ++p) {
                 unsigned int j   = __ldg(&lowerColIdxs[p]);
                 float        val = __ldg(&lowerVals[p]);
-                sum -= val * __ldg(&X[(long)j * k + b]);
+                float        xj  = __ldg(&X[(long)j * k + b]);
+                float prod = __fmul_rn(val, xj);
+                sum = __fsub_rn(sum, prod);
             }
             X[(long)row * k + b] = sum / dg;
         }
